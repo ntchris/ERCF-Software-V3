@@ -77,13 +77,8 @@ class ManualExtruderStepper(kinematics_extruder.ExtruderStepper, manual_stepper.
         gcode.register_mux_command("SYNC_EXTRUDER_MOTION", "EXTRUDER",
                                    self.name, self.cmd_SYNC_EXTRUDER_MOTION,
                                    desc=self.cmd_SYNC_EXTRUDER_MOTION_help)
-        gcode.register_mux_command("SET_EXTRUDER_STEP_DISTANCE", "EXTRUDER",
-                                   self.name, self.cmd_SET_E_STEP_DISTANCE,
-                                   desc=self.cmd_SET_E_STEP_DISTANCE_help)
-        gcode.register_mux_command("SYNC_STEPPER_TO_EXTRUDER", "STEPPER",
-                                   self.name, self.cmd_SYNC_STEPPER_TO_EXTRUDER,
-                                   desc=self.cmd_SYNC_STEPPER_TO_EXTRUDER_help)
 
+        
         # Manual Stepper commands
         gcode.register_mux_command('MANUAL_STEPPER', "STEPPER",
                                    self.name, self.cmd_MANUAL_STEPPER,
