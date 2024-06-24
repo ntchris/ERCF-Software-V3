@@ -135,8 +135,10 @@ class Ercf:
     VARS_ERCF_GATE_STATISTICS_PREFIX = "ercf_statistics_gate_"
     VARS_ERCF_SWAP_STATISTICS        = "ercf_statistics_swaps"
     VARS_ERCF_SELECTOR_OFFSETS       = "ercf_selector_offsets"
-
-    DEFAULT_ENCODER_RESOLUTION = 0.67 # 0.67 is about the resolution of one pulse
+    # for Easy Optical using 1.0, for original TCRT5000 use 0.67
+    EASY_OPTICAL_RESO = 1.0
+    TCRT5000_RESO = 0.67
+    DEFAULT_ENCODER_RESOLUTION = EASY_OPTICAL_RESO # about the resolution of one pulse
     EMPTY_GATE_STATS_ENTRY = {'pauses': 0, 'loads': 0, 'load_distance': 0.0, 'load_delta': 0.0, 'unloads': 0, 'unload_distance': 0.0, 'unload_delta': 0.0, 'servo_retries': 0, 'load_failures': 0, 'unload_failures': 0}
 
     W3C_COLORS = ['aliceblue', 'antiquewhite', 'aqua', 'aquamarine', 'azure', 'beige', 'bisque', 'black', 'blanchedalmond', 'blue', 'blueviolet',
@@ -504,6 +506,7 @@ class Ercf:
             self._log_debug("ercf_log=%s" % ercf_log)
             self.queue_listener = QueueListener(ercf_log)
             self.queue_listener.setFormatter(MultiLineFormatter('%(asctime)s %(message)s', datefmt='%I:%M:%S'))
+
             queue_handler = QueueHandler(self.queue_listener.bg_queue)
             self.ercf_logger = logging.getLogger('ercf')
             self.ercf_logger.setLevel(logging.INFO)
@@ -755,6 +758,7 @@ class Ercf:
         self.reactor.register_callback(self._bootup_tasks, waketime)
 
     def _enable_sync_gear_to_extruder(self):
+        self._log_debug("_enable_sync_gear_to_extruder working")
         if self._check_is_disabled():
             self._log_debug("_enable_sync_gear_to_extruder not enable because ERCF is disabled.")
             return
@@ -1166,7 +1170,7 @@ class Ercf:
         self.servo_state = self.SERVO_UNKNOWN_STATE
 
     def _servo_down(self):
-        if self.servo_state == self.SERVO_DOWN_STATE: return
+        #if self.servo_state == self.SERVO_DOWN_STATE: return
         if self.gate_selected == self.TOOL_BYPASS: return
         self._log_debug("Setting servo to down angle: %d" % (self.servo_down_angle))
         self.toolhead.wait_moves()
@@ -1961,29 +1965,49 @@ class Ercf:
                 self._track_gate_statistics('unload_delta', self.gate_selected, delta)
         return delta
 
-    def _selector_stepper_move_wait(self, dist, wait=True, speed=None, accel=None, homing_move=0):
+    def _selector_stepper_move_wait(self, dist, wait=True, speed=None, accel=None, homing_move=False):
+        self._log_debug("_selector_stepper_move_wait")
+
         if speed == None:
             speed = self.selector_stepper.velocity
         if accel == None:
             accel = self.selector_stepper.accel
-        if homing_move != 0:
-            self._log_stepper("SELECTOR: dist=%.1f, speed=%.1f, accel=%.1f homing=%d" % (dist, speed, accel, homing_move))
+
+        if homing_move:
+            #self._log_debug("_selector_stepper_move_wait")
+
+            self._log_debug("SELECTOR: dist=%.1f, speed=%.1f, accel=%.1f homing=%s" % (dist, speed, accel, homing_move))
             # Don't allow sensorless home moves in rapid succession (TMC limitation)
             if self.sensorless_selector == 1:
                 current_time = self.estimated_print_time(self.reactor.monotonic())
                 time_since_last = self.last_sensorless_move + 2.0 - current_time
+
+                self._log_debug(f"current_time: {current_time} , time_since_last: {time_since_last}")
+
                 if (time_since_last) > 0:
-                    self._log_trace("Wating %.2f seconds before next sensorless homing move" % time_since_last)
+                    self._log_debug("Wating %.2f seconds before next sensorless homing move" % time_since_last)
                     self.toolhead.dwell(time_since_last)
+
                 self.last_sensorless_move = self.estimated_print_time(self.reactor.monotonic())
+                self._log_debug(f"self.last_sensorless_move: {self.last_sensorless_move}")
+                # motor buzzing here !
             elif abs(dist - self.selector_stepper.get_position()[0]) < 12: # Workaround for Timer Too Close error with short homing moves
                 self.toolhead.dwell(1)
-            self.selector_stepper.do_homing_move(dist, speed, accel, homing_move > 0, abs(homing_move) == 1)
+            #     def do_homing_move(self, movepos, speed, accel, triggered, check_trigger):
+            self._log_debug(f"motor is about to make noise")
+            # this function make noise!!
+            self.selector_stepper.do_homing_move(dist, speed, accel, homing_move, homing_move)
+            self._log_debug(f"do_homing_move done!")
+
         else:
             self._log_stepper("SELECTOR: dist=%.1f, speed=%.1f, accel=%.1f" % (dist, speed, accel))
             self.selector_stepper.do_move(dist, speed, accel)
         if wait:
+            self._log_debug(f"about to do wait_moves()")
+
             self.toolhead.wait_moves()
+
+        self._log_debug(f"exiting _selector_stepper_move_wait")
 
     def _buzz_gear_motor(self):
         initial_encoder_position = self.encoder_sensor.get_distance()
@@ -2027,6 +2051,7 @@ class Ercf:
         return (self.toolhead_homing_max - delta) > 1.
 
     def _sync_gear_to_extruder(self, sync=True, servo=False, adjust_tmc_current=False):
+        self._log_debug(f"_sync_gear_to_extruder() sync:{sync}")
         if servo:
             if sync:
                 self._servo_down()
@@ -2161,17 +2186,39 @@ class Ercf:
                 self._log_debug("Possible causes of slippage:\nCalibration ref length too long (hitting extruder gear before homing)\nCalibration ratio for gate is not accurate\nERCF gears are not properly gripping filament\nEncoder reading is inaccurate\nFaulty servo\nLoad speed too fast for encoder to track (>200mm/s)")
 
     # This optional step snugs the filament up to the extruder gears.
-    def _home_to_extruder(self, max_length):
+    def _home_to_extruder(self, max_length, retry=5):
+        # when home filament fails, move filament back for this length and retry home again
+        retry_move_len = 10
+        delta_mvoe_len = 5
         self._servo_down()
         self.filament_direction = self.DIRECTION_LOAD
         self._set_above_min_temp() # This will ensure the extruder stepper is powered to resist collision
-        if self.homing_method == self.EXTRUDER_STALLGUARD:
-            homed, measured_movement = self._home_to_extruder_with_stallguard(max_length)
-        else:
-            homed, measured_movement = self._home_to_extruder_collision_detection(max_length)
-        if not homed:
-            self._set_loaded_status(self.LOADED_STATUS_PARTIAL_END_OF_BOWDEN)
-            raise ErcfError("Failed to reach extruder gear after moving %.1fmm" % max_length)
+        count = 0
+        home_length = max_length
+        while True:
+            homed = False
+            if self.homing_method == self.EXTRUDER_STALLGUARD:
+                self._log_info("self.homing_method == self.EXTRUDER_STALLGUARD:")
+                homed, measured_movement = self._home_to_extruder_with_stallguard(home_length)
+            else:
+                # here!!!!
+                self._log_info("!! here, homed, measured_movement = self._home_to_extruder_collision_detection")
+                homed, measured_movement = self._home_to_extruder_collision_detection(home_length)
+            count += 1
+            if homed:
+                self._log_info(f"_home_to_extruder() homed done! home attempt #{count}")
+                break
+            else:
+
+                if count> retry:
+                   self._set_loaded_status(self.LOADED_STATUS_PARTIAL_END_OF_BOWDEN)
+                   raise ErcfError(f"Failed to reach extruder gear after moving {max_length:.1fmm}, and we have retried {retry} times")
+                else:
+                    # should retry, move filament up a bit
+                    self._log_info(f"_home_to_extruder() homed failed!! move filament back {retry_move_len} and retrying #{count}")
+                    self._gear_stepper_move_wait(retry_move_len)
+                    home_length = retry_move_len + delta_mvoe_len
+
         if measured_movement > (max_length * 0.8):
             self._log_info("Warning: 80% of 'extruder_homing_max' was used homing. You may want to increase your initial load distance ('ercf_calib_ref') or increase 'extruder_homing_max'")
         self._set_loaded_status(self.LOADED_STATUS_PARTIAL_HOMED_EXTRUDER)
@@ -2686,6 +2733,12 @@ class Ercf:
 
     def _home(self, tool = -1, force_unload = -1):
         if self._check_in_bypass(): return
+
+        if self.loaded_status >= self.LOADED_STATUS_PARTIAL_BEFORE_ENCODER:
+            self._log_always(self._state_to_human_string())
+            self._log_always(f"filament is in selector blocking movement, cannot home, but still trying...{self.loaded_status}")
+
+
         current_action = self._set_action(self.ACTION_HOMING)
         try:
             if self._get_calibration_version() != 3:
@@ -2716,28 +2769,50 @@ class Ercf:
             self._set_action(current_action)
 
     def _home_selector(self):
+        home_speed = 70
         self.is_homed = False
+        prev_gate = self.gate_selected
         self.gate_selected = self.GATE_UNKNOWN
         self._servo_up()
         num_channels = len(self.selector_offsets)
-        selector_length = 10. + (num_channels-1)*self.filamentblock_width + ((num_channels-1)//3)*5. + (self.bypass_offset > 0)
-        self._log_debug("Moving up to %.1fmm to home a %d channel ERCF" % (selector_length, num_channels))
+        if prev_gate != self.GATE_UNKNOWN:
+           abit_more = 5
+           home_move_dist = self.selector_offsets[prev_gate] + abit_more
+        else:
+           home_move_dist = 10. + (num_channels-1)*self.filamentblock_width + ((num_channels-1)//3)*5. + (self.bypass_offset > 0)
+        self._log_debug("Moving up to %.1fmm to home a %d channel ERCF" % (home_move_dist, num_channels))
         self.toolhead.wait_moves()
+
+        self.is_homed = self._check_selector_endstop()
+        if self.is_homed:
+            # if already home, move a bit to the other dir
+            MOVE_OTHER_DIR_DIST = 10.0
+            self._log_debug("already in home position, move back a little")
+            self.selector_stepper.do_set_position(0.)
+            self._selector_stepper_move_wait(MOVE_OTHER_DIR_DIST, speed=home_speed/2, homing_move=False)
+            self._log_debug(f"done move back a little bit: {MOVE_OTHER_DIR_DIST}")
+        else:
+            self._log_debug(f"selector is not in home position")
         if self.sensorless_selector == 1:
             try:
                 self.selector_stepper.do_set_position(0.)
-                self._selector_stepper_move_wait(-selector_length, speed=60, homing_move=1)
+                self._log_debug(f"about to do _selector_stepper_move_wait {-home_move_dist}")
+                self._selector_stepper_move_wait(-home_move_dist, speed=home_speed, homing_move=True)
+                self._log_debug(f"_selector_stepper_move_wait done here")
+
                 self.is_homed = self._check_selector_endstop()
-                if not self.is_homed:
-                    self._set_tool_selected(self.TOOL_UNKNOWN)
-                    raise ErcfError("Homing selector failed because of blockage")
+                self._log_debug(f"self.is_homed is {self.is_homed}")
             except Exception as e:
                 # Error, stallguard didn't trigger
                 raise ErcfError("Homing selector failed because error. Klipper reports: %s" % str(e))
+
+            if not self.is_homed:
+                self._set_tool_selected(self.TOOL_UNKNOWN)
+                raise ErcfError(f"After selector home movement finished but endstop is not triggered, maybe driver_SGTHRS is too sensitive, or filament is inside selector/gate {prev_gate}, please check gate {prev_gate}")
         else:
             try:
                 self.selector_stepper.do_set_position(0.)
-                self._selector_stepper_move_wait(-selector_length, speed=100, homing_move=1)   # Fast homing move
+                self._selector_stepper_move_wait(-home_move_dist, speed=100, homing_move=1)   # Fast homing move
                 self.selector_stepper.do_set_position(0.)
                 self._selector_stepper_move_wait(5, False)                      # Ensure some bump space
                 self.selector_stepper.do_set_position(0.)
@@ -2758,8 +2833,8 @@ class Ercf:
         for i in range(4):
             last_move_time = self.toolhead.get_last_move_time()
             if self.sensorless_selector == 1:
-                self._log_debug(f"sensorless selector endstop:{self.gear_endstop.query_endstop}")
                 homed = bool(self.gear_endstop.query_endstop(last_move_time))
+                self._log_debug(f"sensorless selector endstop: {homed}")
             else:
                 homed = bool(self.selector_endstop.query_endstop(last_move_time))
             self._log_debug("Check #%d of %s_endstop: %s" % (i+1, ("gear" if self.sensorless_selector == 1 else "selector"), homed))
@@ -2810,22 +2885,27 @@ class Ercf:
 
     def _attempt_selector_move(self, target):
         selector_steps = self.selector_stepper.steppers[0].get_step_dist()
+        self._log_debug(f"self.selector_stepper.get_position(): {self.selector_stepper.get_position()}")
         init_position = self.selector_stepper.get_position()[0]
         init_mcu_pos = self.selector_stepper.steppers[0].get_mcu_position()
         target_move = target - init_position
         self._selector_stepper_move_wait(target, homing_move=2)
         mcu_position = self.selector_stepper.steppers[0].get_mcu_position()
         travel = (mcu_position - init_mcu_pos) * selector_steps
+        #self._log_debug(f"_attempt_selector_move() traveled: {travel}, mcu_position:{mcu_position}")
+        #self._log_debug(f"init_mcu_pos:{init_mcu_pos} * sel steps:{selector_steps}")
         delta = abs(target_move - travel)
-        self._log_trace("Selector moved %.1fmm of intended travel from: %.1fmm to: %.1fmm (delta: %.1fmm)"
+        self._log_debug("Selector moved %.1fmm of intended travel from: %.1fmm to: %.1fmm (delta: %.1fmm)"
                         % (travel, init_position, target, delta))
-        if delta <= 1.0 :
+        MAX_DELTA_ALLOW = 1.2
+        if delta < MAX_DELTA_ALLOW :
             # True up position
             self._log_trace("Truing selector %.1fmm to %.1fmm" % (delta, target))
             self.selector_stepper.do_set_position(init_position + travel)
             self._selector_stepper_move_wait(target)
             return True, travel
         else:
+            self._log_error(f"selector move delta is too large, most likely it's because selector driver_SGTHRS is too large (too sensitive) {delta} > {MAX_DELTA_ALLOW}")
             return False, travel
 
     # This is the main function for initiating a tool change, handling unload if necessary
@@ -3875,10 +3955,7 @@ class Ercf:
         if self._check_is_disabled(): return
         if self._check_in_bypass(): return
         if self._check_is_loaded(): return
-        self._log_debug(f"cmd_ERCF_PRELOAD() current gate is {self.gate_selected}")
         gate = gcmd.get_int('GATE', default=self.gate_selected, minval=-1, maxval=len(self.selector_offsets) - 1)
-
-        self._log_always(f"command ERCF_PRELOAD has gate {gate}")
         current_action = self._set_action(self.ACTION_CHECKING)
         try:
             self.calibrating = True # To suppress visual filament position
