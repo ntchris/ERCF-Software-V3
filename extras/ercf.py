@@ -226,7 +226,13 @@ class Ercf:
         self.sync_load_extruder = config.getint('sync_load_extruder', 0, minval=0, maxval=1)
         self.sync_unload_extruder = config.getint('sync_unload_extruder', 0, minval=0, maxval=1)
         self.sync_form_tip = config.getint('sync_form_tip', 0, minval=0, maxval=1)
+        # use cutter, do not form tip
+        self.slow_form_tip = config.getint('SLOW_FORM_TIP', 0,  minval=0, maxval=1)
+
+
         self.sync_gear_current = config.getint('sync_gear_current', 50, minval=10, maxval=100)
+        # ported from happy hare 3 to support filament cutter
+        self.post_unload_macro = config.get('post_unload_macro', '_MMU_POST_UNLOAD')
 
         # Options
         self.homing_method = config.getint('homing_method', 0, minval=0, maxval=1)
@@ -447,6 +453,11 @@ class Ercf:
                     self.cmd_ERCF_TEST_CONFIG,
                     desc = self.cmd_ERCF_TEST_CONFIG_help)
 
+        # port back the MMU_TEST_MOVE command from happy hare v3, needed by filament cutter
+        self.gcode.register_command('_MMU_STEP_MOVE', self.cmd_MMU_STEP_MOVE, desc = self.cmd_MMU_STEP_MOVE_help)
+        # after cut, move filament back out of encoder.
+        self.gcode.register_command('ERCF_UNLOAD_ENCODER', self.cmd_ERCF_UNLOAD_ENCODER , desc = self.cmd_ERCF_UNLOAD_ENCODER_help)
+
         # Runout, TTG and Endless spool
         self.gcode.register_command('_ERCF_ENCODER_RUNOUT',
                     self.cmd_ERCF_ENCODER_RUNOUT,
@@ -469,6 +480,7 @@ class Ercf:
         self.gcode.register_command('ERCF_CHECK_GATES',
                     self.cmd_ERCF_CHECK_GATES,
                     desc = self.cmd_ERCF_CHECK_GATES_help)
+
 
     # load from config file for different temperature for different material
     def load_config_min_temp_materials(self, config, material_list):
@@ -1883,10 +1895,41 @@ class Ercf:
         self.gcode.run_script_from_command("SAVE_VARIABLE VARIABLE=%s VALUE=%d" % (self.VARS_ERCF_LOADED_STATUS, self.loaded_status))
         self._log_always("ERCF state reset")
 
+    cmd_MMU_STEP_MOVE_help = "User composable loading step: Generic move"
+    # port from happy hare v3 for cutter support
+    def cmd_MMU_STEP_MOVE(self, gcmd):
+        self._log_debug(gcmd.get_commandline())
+        try:
+            self._move_cmd(gcmd, "User defined step move")
+        except Exception as ee:
+            raise gcmd.error("_MMU_STEP_MOVE: %s" % str(ee))
+
+    cmd_ERCF_UNLOAD_ENCODER_help = "unload filament from encoder (move back, move out of encoder)"
+    def cmd_ERCF_UNLOAD_ENCODER(self, gcmd):
+        max = 60
+        self._unload_encoder(max)
 
 ####################################################################################
 # GENERAL MOTOR HELPERS - All stepper movements should go through here for tracing #
 ####################################################################################
+    def _move_cmd(self, gcmd, trace_str):
+        if self._check_is_disabled(): return
+        if self._check_in_bypass(): return
+        move = gcmd.get_float('MOVE', 10.)
+        speed = gcmd.get_float('SPEED', None)
+        accel = gcmd.get_float('ACCEL', None)
+        motor = gcmd.get('MOTOR', "gear")
+        wait = bool(gcmd.get_int('WAIT', 0, minval=0, maxval=1))
+        sync = bool(gcmd.get_int('SYNC', 0, minval=0, maxval=1))
+        if motor not in ["gear", "extruder", "gear+extruder", "synced", "both"]:
+            raise gcmd.error("Valid motor names are 'gear', 'extruder', 'gear+extruder', 'synced' or 'both'")
+        if motor == "extruder":
+            self._servo_up()
+        else:
+            self._servo_down()
+        self._log_debug("Moving '%s' motor %.1fmm..." % (motor, move))
+        return self._trace_filament_move(trace_str, move, speed=speed, accel=accel, motor=motor  )
+
 
     def _gear_stepper_move_wait(self, dist, wait=True, speed=None, accel=None, sync=True):
         self._sync_gear_to_extruder(False) # Safety
@@ -2212,7 +2255,7 @@ class Ercf:
 
                 if count> retry:
                    self._set_loaded_status(self.LOADED_STATUS_PARTIAL_END_OF_BOWDEN)
-                   raise ErcfError(f"Failed to reach extruder gear after moving {max_length:.1fmm}, and we have retried {retry} times")
+                   raise ErcfError(f"Failed to reach extruder gear after moving {max_length:.1f}mm, and we have retried {retry} times")
                 else:
                     # should retry, move filament up a bit
                     self._log_info(f"_home_to_extruder() homed failed!! move filament back {retry_move_len} and retrying #{count}")
@@ -2377,8 +2420,12 @@ class Ercf:
         if self.loaded_status == self.LOADED_STATUS_UNLOADED:
             self._log_debug("Tool already unloaded")
             return
-        self._log_debug("Unloading tool %s %s %s" % (self._selected_tool_string(), self.material_selected, self.min_temp_extruder))
+
+        self._log_debug(f"_unload_tool()  {self._selected_tool_string()}, {self.material_selected}, {self.min_temp_extruder} {skip_tip=}")
         self._unload_sequence(self._get_calibration_ref(), skip_tip=skip_tip)
+
+        self.gcode.run_script_from_command(self.post_unload_macro)
+
 
     def _unload_sequence(self, length, check_state=False, skip_sync_move=False, skip_tip=False):
         self._log_debug(f"_unload_sequence length:{length}, check_state:{check_state}, skip_sync:{skip_sync_move}, skip_tip:{skip_tip}")
@@ -2510,6 +2557,8 @@ class Ercf:
             out_of_extruder = False
 
             if self._has_toolhead_sensor():
+                self._log_debug("_unload_extruder() self._has_toolhead_sensor()")
+
                 # This strategy supports both extruder only and 'synced' modes of operation
                 motor = "synced" if sync_allowed else "extruder"
                 safety_margin = 5.
@@ -2533,6 +2582,8 @@ class Ercf:
                         break
 
             elif not sync_allowed:
+                self._log_debug("_unload_extruder() NOT sync_allowed")
+
                 # No toolhead sensor and not syncing gear and extruder motors:
                 # Back up around 15mm at a time until either the encoder doesn't see any movement
                 # Do this until we have traveled more than the length of the extruder
@@ -2551,6 +2602,8 @@ class Ercf:
                         break
 
             else:
+                self._log_debug("_unload_extruder() else")
+
                 # No toolhead sensor with synced steppers:
                 # Back up in sync around 15mm at a time for more than length of the extruder
                 # Then back up the extruder a bit to make sure that the encoder doesn't see any movement
@@ -3091,7 +3144,13 @@ class Ercf:
         quiet = gcmd.get_int('QUIET', 0, minval=0, maxval=1)
         tool = gcmd.get_int('TOOL', minval=0, maxval=len(self.selector_offsets)-1)
         standalone = bool(gcmd.get_int('STANDALONE', 0, minval=0, maxval=1))
+
+
+
         skip_tip = self._is_in_print() and not standalone
+
+        self._log_always(f"cmd_ERCF_CHANGE_TOOL {standalone=}, {tool=}, {skip_tip=}")
+
         if self.loaded_status == self.LOADED_STATUS_UNKNOWN and self.is_homed: # Will be done later if not homed
             self._log_error("Unknown filament position, recovering state...")
             self._recover_loaded_state()
@@ -3142,13 +3201,27 @@ class Ercf:
         if self._check_is_paused(): return
         extruder_only = bool(gcmd.get_int('EXTRUDER_ONLY', 0, minval=0, maxval=1) or bypass)
         restore_encoder = self._disable_encoder_sensor() # Don't want runout accidently triggering during filament unload
+
+        self._log_debug(f"cmd_ERCF_EJECT has {self.slow_form_tip=}")
+        if not self.slow_form_tip:
+            self._log_always(f"cmd_ERCF_EJECT has {self.slow_form_tip=}, do NOT form tip to save time! (usually with a cutter)")
+        else:
+            self._log_always(f"cmd_ERCF_EJECT has {self.slow_form_tip=}, spend the time to slowly form tip!")
         try:
             if self.tool_selected != self.TOOL_BYPASS and not extruder_only:
-                self._unload_tool()
+                self._log_debug(f"cmd_ERCF_EJECT about _unload_tool() {self.slow_form_tip=}")
+                self._unload_tool(skip_tip=(not self.slow_form_tip))
+
             elif self.loaded_status != self.LOADED_STATUS_UNLOADED or extruder_only:
                 # do we always need to form tip??
                 # check if filament is NOT in extruder gear
-                if self._form_tip_standalone(disable_sync=True):
+                # !!!!!!
+                self._log_debug(f"cmd_ERCF_EJECT self.loaded_status != self.LOADED_STATUS_UNLOADED or extruder_only {self.loaded_status=} {extruder_only=}")
+
+                r = True
+                if self.slow_form_tip:
+                    r = self._form_tip_standalone(disable_sync=True)
+                if r:
                     self._unload_extruder(disable_sync=True)
                 if self.tool_selected == self.TOOL_BYPASS:
                     self._set_loaded_status(self.LOADED_STATUS_UNLOADED)
