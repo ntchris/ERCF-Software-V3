@@ -3145,11 +3145,12 @@ class Ercf:
         tool = gcmd.get_int('TOOL', minval=0, maxval=len(self.selector_offsets)-1)
         standalone = bool(gcmd.get_int('STANDALONE', 0, minval=0, maxval=1))
 
+        is_in_print = self._is_in_print()
+        skip_tip = is_in_print and not standalone
+        if not skip_tip:
+            skip_tip = not self.slow_form_tip
 
-
-        skip_tip = self._is_in_print() and not standalone
-
-        self._log_always(f"cmd_ERCF_CHANGE_TOOL {standalone=}, {tool=}, {skip_tip=}")
+        self._log_always(f"cmd_ERCF_CHANGE_TOOL {is_in_print=}, {standalone=}, {tool=}, {skip_tip=}")
 
         if self.loaded_status == self.LOADED_STATUS_UNKNOWN and self.is_homed: # Will be done later if not homed
             self._log_error("Unknown filament position, recovering state...")
