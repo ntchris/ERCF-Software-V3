@@ -21,7 +21,7 @@
 import logging, logging.handlers, threading, queue, time
 import textwrap, math, os.path, re, json
 from random import randint
-
+from time import sleep
 # Forward all messages through a queue (polled by background thread)
 class QueueHandler(logging.Handler):
     def __init__(self, queue):
@@ -1777,11 +1777,14 @@ class Ercf:
     def _set_above_min_temp(self, target_temp=-1):
         extruder_heater = self.printer.lookup_object(self.extruder_name).heater
         current_temp = self.printer.lookup_object(self.extruder_name).get_status(0)['temperature']
+        self._log_debug(f"_set_above_min_temp() {target_temp=}, {extruder_heater.target_temp=}, {self.min_temp_extruder=}")
 
-        target_temp = max(target_temp, extruder_heater.target_temp, self.min_temp_extruder)
+        target_temp = max(target_temp, self.min_temp_extruder)
+        self._log_debug(f"_set_above_min_temp() target_temp is now  {target_temp=} ")
+
         new_target = False
-        if extruder_heater.target_temp < target_temp:
-            if (target_temp == self.min_temp_extruder):
+        if not math.isclose(extruder_heater.target_temp,  target_temp):
+            if math.isclose(target_temp, self.min_temp_extruder):
                 self._log_error("Heating extruder for material: %s to minimum temp %.1fC" % (self.material_selected, target_temp))
             else:
                 self._log_info("Heating extruder to desired temp (%.1f)" % target_temp)
@@ -2122,7 +2125,7 @@ class Ercf:
 
     # Primary method to selects and loads tool. Assumes we are unloaded.
     def _select_and_load_tool(self, tool):
-        self._log_debug('Loading tool T%d...' % tool)
+        self._log_debug('_select_and_load_tool() Loading tool T%d...' % tool)
         self._select_tool(tool, move_servo=False)
         gate = self.tool_to_gate_map[tool]
         if self.gate_status[gate] == self.GATE_EMPTY:
@@ -2244,8 +2247,8 @@ class Ercf:
                 self._log_info("self.homing_method == self.EXTRUDER_STALLGUARD:")
                 homed, measured_movement = self._home_to_extruder_with_stallguard(home_length)
             else:
-                # here!!!!
-                self._log_info("!! here, homed, measured_movement = self._home_to_extruder_collision_detection")
+                # here!
+                self._log_info("here, homed, measured_movement = self._home_to_extruder_collision_detection")
                 homed, measured_movement = self._home_to_extruder_collision_detection(home_length)
             count += 1
             if homed:
@@ -2897,6 +2900,8 @@ class Ercf:
         return homed
 
     def _move_selector_sensorless(self, target):
+        self._log_info(f"_move_selector_sensorless() to {target=}")
+
         successful, travel = self._attempt_selector_move(target)
         if not successful:
             if abs(travel) < 3.0:       # Filament stuck in the current selector
@@ -3027,6 +3032,11 @@ class Ercf:
         current_action = self._set_action(self.ACTION_SELECTING)
         try:
             self._servo_up()
+            # can it help?? allow 600ms before move selector, to let power to be stable, most likely a servo UP just ran
+            # otherwise an anoying fatal error can happen randomly
+            # TMC 'manual_stepper selector_stepper' reports error: GSTAT:      00000004 uv_cp=1(Undervoltage!)
+            sleep(0.8)
+
             if gate == self.TOOL_BYPASS:
                 offset = self.bypass_offset
             else:
@@ -3055,10 +3065,24 @@ class Ercf:
             self._set_action(current_action)
 
     def _set_gate_selected(self, gate):
+        self._log_debug(f"_set_gate_selected() current gate:{self.gate_selected}, new {gate=}")
+
+        old_material_temp = self.get_selected_material_min_temp()
+
         self.gate_selected = gate
         self.gcode.run_script_from_command("SAVE_VARIABLE VARIABLE=%s VALUE=%d" % (self.VARS_ERCF_GATE_SELECTED, self.gate_selected))
         self.material_selected = self.get_selected_material()
-        self.min_temp_extruder = self.get_selected_material_min_temp()
+        new_material_temp = self.get_selected_material_min_temp()
+        # when higher temp material is in extruder (current material), and now we need to low new material with lower temp
+        # we still need to use higher temp to extrude the old material, but with very slightly lower temp
+        Lower_Temp_Delta = 1.0
+        if old_material_temp > (new_material_temp + Lower_Temp_Delta):
+            lower_old_material_temp = old_material_temp - Lower_Temp_Delta
+            self._log_info(
+                f"_set_gate_selected() in extruder material(high {old_material_temp}) has higher temp than new material(low, {new_material_temp}), use slightly lower temp of in extruder material(high) to load new material: {lower_old_material_temp}")
+            # reduce the old high temp a little bit since the new material has lower temp and we need to extrude the old high temp material
+            new_material_temp = lower_old_material_temp
+        self.min_temp_extruder = new_material_temp
         self._log_info(f"selected gate:{gate}, material:{self.material_selected}, min temp:{self.min_temp_extruder}")
 
     def _set_tool_selected(self, tool, silent=False):
@@ -3216,7 +3240,7 @@ class Ercf:
             elif self.loaded_status != self.LOADED_STATUS_UNLOADED or extruder_only:
                 # do we always need to form tip??
                 # check if filament is NOT in extruder gear
-                # !!!!!!
+
                 self._log_debug(f"cmd_ERCF_EJECT self.loaded_status != self.LOADED_STATUS_UNLOADED or extruder_only {self.loaded_status=} {extruder_only=}")
 
                 r = True
