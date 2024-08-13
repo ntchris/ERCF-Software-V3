@@ -1375,11 +1375,11 @@ class Ercf:
             measurement = self.encoder_sensor.get_distance()
             ratio = (test_length * 2) / (measurement - encoder_moved)
             self._log_always("Calibration move of %.1fmm, average encoder measurement %.1fmm - Ratio is %.6f" % (test_length * 2, measurement - encoder_moved, ratio))
-            if not tool == 0:
-                if ratio > 0.8 and ratio < 1.2:
-                    self.gcode.run_script_from_command("SAVE_VARIABLE VARIABLE=%s%d VALUE=%.6f" % (self.VARS_ERCF_CALIB_PREFIX, tool, ratio))
-                else:
-                    self._log_always("Calibration ratio not saved because it is not considered valid (0.8 < ratio < 1.2)")
+
+            if ratio > 0.8 and ratio < 1.2:
+                self.gcode.run_script_from_command("SAVE_VARIABLE VARIABLE=%s%d VALUE=%.6f" % (self.VARS_ERCF_CALIB_PREFIX, tool, ratio))
+            else:
+                self._log_always("Calibration ratio not saved because it is not considered valid (0.8 < ratio < 1.2)")
             self._unload_encoder(self.unload_buffer)
             self._set_loaded_status(self.LOADED_STATUS_UNLOADED)
         except ErcfError as ee:
@@ -1434,7 +1434,8 @@ class Ercf:
         try:
             self._reset_ttg_mapping() # Because historically the parameter is TOOL not GATE
             self.calibrating = True
-            self._home(tool)
+            if not self.is_homed:
+                self._home(tool)
 
             # if user provide ref=1 then do the heat up extruder calibration ref.
             # otherwise do _calculate_calibration_ratio() (even it's for tool 0 )
@@ -1558,7 +1559,9 @@ class Ercf:
             else:
                 self._log_always("Selector position = %.1fmm" % traveled)
                 self.selector_offsets[gate] = round(traveled, 1)
-                self.gcode.run_script_from_command("SAVE_VARIABLE VARIABLE=%s VALUE=\"%s\"" % (self.VARS_ERCF_SELECTOR_OFFSETS, self.selector_offsets))
+                self._log_always(f"saving variable {self.VARS_ERCF_SELECTOR_OFFSETS} : {self.selector_offsets}")
+
+                self.gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE={self.VARS_ERCF_SELECTOR_OFFSETS} VALUE=\"{self.selector_offsets}\"")
                 self._log_always("Selector offset (%.1fmm) for gate #%d has been saved" % (traveled, gate))
         except ErcfError as ee:
             self._pause(str(ee))
@@ -1779,7 +1782,7 @@ class Ercf:
         current_temp = self.printer.lookup_object(self.extruder_name).get_status(0)['temperature']
         self._log_debug(f"_set_above_min_temp() {target_temp=}, {extruder_heater.target_temp=}, {self.min_temp_extruder=}")
 
-        target_temp = max(target_temp, self.min_temp_extruder)
+        target_temp = max(target_temp, self.min_temp_extruder, extruder_heater.target_temp)
         self._log_debug(f"_set_above_min_temp() target_temp is now  {target_temp=} ")
 
         new_target = False
@@ -2172,6 +2175,7 @@ class Ercf:
             self._track_load_end()
             self._set_action(current_action)
 
+
     # Load filament past encoder and return the actual measured distance detected by encoder
     def _load_encoder(self, retry=True, servo_up_on_error=True):
         self._servo_down()
@@ -2232,7 +2236,7 @@ class Ercf:
                 self._log_debug("Possible causes of slippage:\nCalibration ref length too long (hitting extruder gear before homing)\nCalibration ratio for gate is not accurate\nERCF gears are not properly gripping filament\nEncoder reading is inaccurate\nFaulty servo\nLoad speed too fast for encoder to track (>200mm/s)")
 
     # This optional step snugs the filament up to the extruder gears.
-    def _home_to_extruder(self, max_length, retry=5):
+    def _home_to_extruder(self, max_length, retry=10):
         # when home filament fails, move filament back for this length and retry home again
         retry_move_len = 10
         delta_mvoe_len = 5
@@ -2794,7 +2798,6 @@ class Ercf:
             self._log_always(self._state_to_human_string())
             self._log_always(f"filament is in selector blocking movement, cannot home, but still trying...{self.loaded_status}")
 
-
         current_action = self._set_action(self.ACTION_HOMING)
         try:
             if self._get_calibration_version() != 3:
@@ -2826,13 +2829,15 @@ class Ercf:
 
     def _home_selector(self):
         home_speed = 70
+        home_accel = 60
         self.is_homed = False
         prev_gate = self.gate_selected
         self.gate_selected = self.GATE_UNKNOWN
         self._servo_up()
         num_channels = len(self.selector_offsets)
+        abit_more = 3
+
         if prev_gate != self.GATE_UNKNOWN:
-           abit_more = 5
            home_move_dist = self.selector_offsets[prev_gate] + abit_more
         else:
            home_move_dist = 10. + (num_channels-1)*self.filamentblock_width + ((num_channels-1)//3)*5. + (self.bypass_offset > 0)
@@ -2845,18 +2850,22 @@ class Ercf:
             MOVE_OTHER_DIR_DIST = 10.0
             self._log_debug("already in home position, move back a little")
             self.selector_stepper.do_set_position(0.)
-            self._selector_stepper_move_wait(MOVE_OTHER_DIR_DIST, speed=home_speed/2, homing_move=False)
+            self._selector_stepper_move_wait(MOVE_OTHER_DIR_DIST, speed=home_speed, homing_move=False)
+            # so next home move only need to go a little bit distance
+            home_move_dist = MOVE_OTHER_DIR_DIST + abit_more
             self._log_debug(f"done move back a little bit: {MOVE_OTHER_DIR_DIST}")
+            self.is_homed = False
         else:
             self._log_debug(f"selector is not in home position")
+
+        self._log_debug(f"about to do home move dist: {home_move_dist}")
         if self.sensorless_selector == 1:
             try:
                 self.selector_stepper.do_set_position(0.)
                 self._log_debug(f"about to do _selector_stepper_move_wait {-home_move_dist}")
                 self._selector_stepper_move_wait(-home_move_dist, speed=home_speed, homing_move=True)
-                self._log_debug(f"_selector_stepper_move_wait done here")
-
                 self.is_homed = self._check_selector_endstop()
+
                 self._log_debug(f"self.is_homed is {self.is_homed}")
             except Exception as e:
                 # Error, stallguard didn't trigger
@@ -2990,6 +2999,7 @@ class Ercf:
 
         # Check TTG map. We might be mapped to same gate
         if self.tool_to_gate_map[tool] == self.gate_selected and self.loaded_status == self.LOADED_STATUS_FULL:
+            self._log_debug(f"_change_tool() about to call self._select_tool({tool=})")
             self._select_tool(tool)
             self.gcode.run_script_from_command("M117 T%s" % tool)
             return
@@ -3001,6 +3011,7 @@ class Ercf:
             skip_unload = True
 
         if not skip_unload:
+            self._log_debug(f"_change_tool() about to call self._unload_tool({skip_tip=})")
             self._unload_tool(skip_tip=skip_tip)
         self._select_and_load_tool(tool)
         self._track_swap_completed()
@@ -3028,6 +3039,8 @@ class Ercf:
         self._log_info("Tool T%d enabled%s" % (tool, (" on gate #%d" % gate) if tool != gate else ""))
 
     def _select_gate(self, gate):
+        self._log_info(f"_select_gate() working {gate=}")
+
         if gate == self.gate_selected: return
         current_action = self._set_action(self.ACTION_SELECTING)
         try:
@@ -3072,18 +3085,30 @@ class Ercf:
         self.gate_selected = gate
         self.gcode.run_script_from_command("SAVE_VARIABLE VARIABLE=%s VALUE=%d" % (self.VARS_ERCF_GATE_SELECTED, self.gate_selected))
         self.material_selected = self.get_selected_material()
-        new_material_temp = self.get_selected_material_min_temp()
-        # when higher temp material is in extruder (current material), and now we need to low new material with lower temp
-        # we still need to use higher temp to extrude the old material, but with very slightly lower temp
-        Lower_Temp_Delta = 1.0
-        if old_material_temp > (new_material_temp + Lower_Temp_Delta):
-            lower_old_material_temp = old_material_temp - Lower_Temp_Delta
+
+        self._log_info(f"self._is_in_print()={self._is_in_print()}")
+        self._log_info(f"self._is_in_pause()={self._is_in_pause()}")
+
+        if not self._is_in_print() and not self._is_in_pause():
+
+
+            new_material_temp = self.get_selected_material_min_temp()
+            # when higher temp material is in extruder (current material), and now we need to low new material with lower temp
+            # we still need to use higher temp to extrude the old material, but with very slightly lower temp
+            Lower_Temp_Delta = 1.0
+            if old_material_temp > (new_material_temp + Lower_Temp_Delta):
+                lower_old_material_temp = old_material_temp - Lower_Temp_Delta
+                self._log_info(
+                    f"_set_gate_selected() in extruder material(high {old_material_temp}) has higher temp than new material(low, {new_material_temp}), use slightly lower temp of in extruder material(high) to load new material: {lower_old_material_temp}")
+                # reduce the old high temp a little bit since the new material has lower temp and we need to extrude the old high temp material
+                new_material_temp = lower_old_material_temp
+            self.min_temp_extruder = new_material_temp
             self._log_info(
-                f"_set_gate_selected() in extruder material(high {old_material_temp}) has higher temp than new material(low, {new_material_temp}), use slightly lower temp of in extruder material(high) to load new material: {lower_old_material_temp}")
-            # reduce the old high temp a little bit since the new material has lower temp and we need to extrude the old high temp material
-            new_material_temp = lower_old_material_temp
-        self.min_temp_extruder = new_material_temp
-        self._log_info(f"selected gate:{gate}, material:{self.material_selected}, min temp:{self.min_temp_extruder}")
+                f"selected gate:{gate}, material:{self.material_selected}, min temp:{self.min_temp_extruder}")
+
+        else:
+            # temperature is set by gcode file
+            self._log_info(f"printing! so don't mess with temperature")
 
     def _set_tool_selected(self, tool, silent=False):
         self.tool_selected = tool
@@ -3170,11 +3195,12 @@ class Ercf:
         standalone = bool(gcmd.get_int('STANDALONE', 0, minval=0, maxval=1))
 
         is_in_print = self._is_in_print()
+        is_pause = self._is_in_pause()
         skip_tip = is_in_print and not standalone
         if not skip_tip:
             skip_tip = not self.slow_form_tip
 
-        self._log_always(f"cmd_ERCF_CHANGE_TOOL {is_in_print=}, {standalone=}, {tool=}, {skip_tip=}")
+        self._log_always(f"cmd_ERCF_CHANGE_TOOL {is_in_print=}, {is_pause=} {standalone=}, {tool=}, {skip_tip=}")
 
         if self.loaded_status == self.LOADED_STATUS_UNKNOWN and self.is_homed: # Will be done later if not homed
             self._log_error("Unknown filament position, recovering state...")
