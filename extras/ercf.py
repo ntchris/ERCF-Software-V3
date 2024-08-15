@@ -22,6 +22,10 @@ import logging, logging.handlers, threading, queue, time
 import textwrap, math, os.path, re, json
 from random import randint
 from time import sleep
+
+
+Selector_Stepper_Motor_Name = "manual_stepper selector_stepper"
+
 # Forward all messages through a queue (polled by background thread)
 class QueueHandler(logging.Handler):
     def __init__(self, queue):
@@ -233,6 +237,8 @@ class Ercf:
         self.sync_gear_current = config.getint('sync_gear_current', 50, minval=10, maxval=100)
         # ported from happy hare 3 to support filament cutter
         self.post_unload_macro = config.get('post_unload_macro', '_MMU_POST_UNLOAD')
+        #self.selector_hold_current = config.getfloat('hold_current', 0.001, minval=10, maxval=1.5)
+        #self.selector_run_current = config.getfloat('run_current', 0.001, minval=10, maxval=1.5)
 
         # Options
         self.homing_method = config.getint('homing_method', 0, minval=0, maxval=1)
@@ -527,10 +533,12 @@ class Ercf:
         self.toolhead = self.printer.lookup_object('toolhead')
         for manual_stepper in self.printer.lookup_objects('manual_stepper'):
             stepper_name = manual_stepper[1].get_steppers()[0].get_name()
-            if stepper_name == 'manual_stepper selector_stepper':
+            if stepper_name == Selector_Stepper_Motor_Name:
                 self.selector_stepper = manual_stepper[1]
+                self.selector_name = Selector_Stepper_Motor_Name.split()[1]
+
         if self.selector_stepper is None:
-            raise self.config.error("Missing [manual_stepper selector_stepper] section in ercf_hardware.cfg")
+            raise self.config.error(f"Missing [{Selector_Stepper_Motor_Name}] section in ercf_hardware.cfg")
         for manual_stepper in self.printer.lookup_objects('manual_extruder_stepper'):
             stepper_name = manual_stepper[1].get_steppers()[0].get_name()
             if stepper_name == 'manual_extruder_stepper gear_stepper':
@@ -557,7 +565,7 @@ class Ercf:
         self.query_endstops = self.printer.lookup_object('query_endstops')
         self.selector_endstop = self.gear_endstop = None
         for endstop, name in self.query_endstops.endstops:
-            if name == 'manual_stepper selector_stepper':
+            if name == Selector_Stepper_Motor_Name:
                 self.selector_endstop = endstop
             if name == 'manual_extruder_stepper gear_stepper':
                 self.gear_endstop = endstop
@@ -584,6 +592,17 @@ class Ercf:
         # on gear_stepper and tip forming on extruder
         self.gear_tmc = self.extruder_tmc = None
         tmc_chips = ["tmc2209", "tmc2130", "tmc2208", "tmc2660", "tmc5160", "tmc2240"]
+        self.selector_tmc = None
+        for chip in tmc_chips:
+            try:
+                self.selector_tmc = self.printer.lookup_object(f'{chip} {Selector_Stepper_Motor_Name}')
+                self._log_debug(f"Found {chip} on selector_stepper. hold current control is enabled")
+                break
+            except:
+                pass
+        if self.selector_tmc is None:
+            self._log_debug("TMC driver not found for selector stepper, cannot use current control for sensorless homing")
+
         for chip in tmc_chips:
             try:
                 self.gear_tmc = self.printer.lookup_object('%s manual_extruder_stepper gear_stepper' % chip)
@@ -2015,7 +2034,7 @@ class Ercf:
         return delta
 
     def _selector_stepper_move_wait(self, dist, wait=True, speed=None, accel=None, homing_move=False):
-        self._log_debug("_selector_stepper_move_wait")
+        self._log_debug(f"_selector_stepper_move_wait {dist=} {speed=} {accel=} {homing_move=}")
 
         if speed == None:
             speed = self.selector_stepper.velocity
@@ -2039,14 +2058,42 @@ class Ercf:
 
                 self.last_sensorless_move = self.estimated_print_time(self.reactor.monotonic())
                 self._log_debug(f"self.last_sensorless_move: {self.last_sensorless_move}")
+
+                # should increase hold current ??
+                self.selector_run_current = self.selector_tmc.get_status(0)['run_current']
+                self.selector_hold_current = self.selector_tmc.get_status(0)['hold_current']
+
+                if self.selector_hold_current < self.selector_run_current * 0.95:
+                    increased_hold_current = True
+                    higher_hold_current = self.selector_run_current
+                    higher_hold_current_text = f"{higher_hold_current:.3f}"
+                    self._log_always(
+                        f"about to do sensorless home, increasing selector hold current from {self.selector_hold_current:.3f} to {higher_hold_current_text}")
+                    self.gcode.run_script_from_command(
+                        f"SET_TMC_CURRENT STEPPER={self.selector_name} HOLDCURRENT={higher_hold_current_text}")
+                    sleep(0.5)
+                else:
+                    self._log_debug("hold current is already high enouch, no need to adjust")
+                    increased_hold_current = False
+
+
                 # motor buzzing here !
             elif abs(dist - self.selector_stepper.get_position()[0]) < 12: # Workaround for Timer Too Close error with short homing moves
                 self.toolhead.dwell(1)
             #     def do_homing_move(self, movepos, speed, accel, triggered, check_trigger):
+
+
             self._log_debug(f"motor is about to make noise")
             # this function make noise!!
+
             self.selector_stepper.do_homing_move(dist, speed, accel, homing_move, homing_move)
-            self._log_debug(f"do_homing_move done!")
+            self._log_debug(f"sensorless do_homing_move done!")
+            if increased_hold_current:
+               self._log_always(
+                   f"finished sensorless home, restore the previous hold current {self.selector_hold_current:.3f}")
+               self.gcode.run_script_from_command(
+                   f"SET_TMC_CURRENT STEPPER={self.selector_name} HOLDCURRENT={self.selector_hold_current:.3f}")
+               sleep(0.5)
 
         else:
             self._log_stepper("SELECTOR: dist=%.1f, speed=%.1f, accel=%.1f" % (dist, speed, accel))
@@ -2860,6 +2907,7 @@ class Ercf:
 
         self._log_debug(f"about to do home move dist: {home_move_dist}")
         if self.sensorless_selector == 1:
+
             try:
                 self.selector_stepper.do_set_position(0.)
                 self._log_debug(f"about to do _selector_stepper_move_wait {-home_move_dist}")
@@ -2870,6 +2918,7 @@ class Ercf:
             except Exception as e:
                 # Error, stallguard didn't trigger
                 raise ErcfError("Homing selector failed because error. Klipper reports: %s" % str(e))
+
 
             if not self.is_homed:
                 self._set_tool_selected(self.TOOL_UNKNOWN)
@@ -2956,7 +3005,7 @@ class Ercf:
         init_position = self.selector_stepper.get_position()[0]
         init_mcu_pos = self.selector_stepper.steppers[0].get_mcu_position()
         target_move = target - init_position
-        self._selector_stepper_move_wait(target, homing_move=2)
+        self._selector_stepper_move_wait(target, homing_move=True)
         mcu_position = self.selector_stepper.steppers[0].get_mcu_position()
         travel = (mcu_position - init_mcu_pos) * selector_steps
         #self._log_debug(f"_attempt_selector_move() traveled: {travel}, mcu_position:{mcu_position}")
